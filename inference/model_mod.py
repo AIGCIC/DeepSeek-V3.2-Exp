@@ -294,7 +294,7 @@ class RMSNorm(nn.Module):
         Returns:
             torch.Tensor: Normalized tensor with the same shape as input.
         """
-        dtype = x.dtype
+        dtype = torch.bfloat16
         if residual is None:
             x = x.float()
             var = x.pow(2).mean(-1, keepdim=True)
@@ -550,17 +550,21 @@ class MLA(nn.Module):
         """
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
+        q_o = self.wq_a(x)
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr)
         q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
+
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         q_pe = apply_rotary_emb(q_pe, freqs_cis)
         kv = self.wkv_a(x)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+
         kv = self.kv_norm(kv)
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
         self.kv_cache[:bsz, start_pos:end_pos] = kv
         self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
+    
         if mask is not None:    # MHA prefill
             q = torch.cat([q_nope, q_pe], dim=-1)
             kv = self.wkv_b(kv)
@@ -832,6 +836,7 @@ class Block(nn.Module):
         Returns:
             torch.Tensor: Output tensor after block computation.
         """
+        """
         if residual is None:
             x, residual = self.attn_norm(x), x
         else:
@@ -840,6 +845,16 @@ class Block(nn.Module):
         x, residual = self.ffn_norm(x, residual)
         x = self.ffn(x)
         return x, residual
+        """
+
+        if residual is None:
+            x_residual = x.float()
+        else:
+            x_residual = x.float() + residual.float()
+        x = self.attn(self.attn_norm(x_residual), start_pos, freqs_cis, mask)
+
+        x_residual = x.float() + x_residual.float()
+        return self.ffn(self.ffn_norm(x_residual)), x_residual.to(torch.bfloat16)
 
 
 class Transformer(nn.Module):
