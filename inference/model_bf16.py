@@ -7,13 +7,125 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
-
+import triton
+import triton.language as tl
 from kernel import act_quant, fp8_gemm, fp8_index
 
 
 world_size = 1
 rank = 0
 block_size = 128
+# Use bf16 gemm
+gemm_impl: Literal["bf16", "fp8"] = "bf16"
+
+@triton.jit
+def weight_dequant_kernel(  # type: ignore
+    x_ptr,
+    s_ptr,
+    y_ptr,
+    M_Size: tl.constexpr,
+    N_Size: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+) -> None:
+    """
+    Weight dequantization kernel.
+
+    Dequantizes weights using the provided scaling factors and stores the
+        result.
+
+    Args:
+        x_ptr (tl.pointer): Pointer to the quantized weights.
+        s_ptr (tl.pointer): Pointer to the scaling factors.
+        y_ptr (tl.pointer): Pointer to the output buffer for dequantized
+            weights.
+        M (int): Number of rows in the weight matrix.
+        N (int): Number of columns in the weight matrix.
+        BLOCK_SIZE (tl.constexpr): Size of the block for tiling.
+
+    Returns:
+        None
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    n_size = tl.cdiv(N_Size, BLOCK_SIZE)
+    offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offs = offs_m[:, None] * N_Size + offs_n[None, :]
+    mask = (offs_m[:, None] < M_Size) & (offs_n[None, :] < N_Size)
+    x_in = tl.load(x_ptr + offs, mask=mask).to(tl.float32)
+    s_in = tl.load(s_ptr + pid_m * n_size + pid_n)
+    y_out = x_in * s_in
+    tl.store(y_ptr + offs, y_out, mask=mask)
+
+
+def weight_dequant(x_in: torch.Tensor, s_in: torch.Tensor, block_size: int = 128) -> torch.Tensor:
+    """
+    Dequantizes the given weight tensor using the provided scale tensor.
+
+    Args:
+        x_in (torch.Tensor): The quantized weight tensor of shape (M, N).
+        s_in (torch.Tensor): The scale tensor of shape (M//block_size,
+            N//block_size).
+        block_size (int, optional): The block size to use for dequantization.
+            Defaults to 128.
+
+    Returns:
+        torch.Tensor: The dequantized weight tensor of the same shape as `x`.
+
+    Raises:
+        AssertionError: If `x` or `s` are not contiguous or if their dimensions
+            are not 2.
+    """
+    assert x_in.is_contiguous() and s_in.is_contiguous(), "Input tensors must be contiguous"
+    assert x_in.dim() == 2 and s_in.dim() == 2, "Input tensors must have 2 dimensions"
+    M_Size, N_Size = x_in.size()
+    y_out = torch.empty_like(x_in, dtype=torch.get_default_dtype())
+    grid = lambda meta: (  # noqa: E731
+        triton.cdiv(M_Size, meta["BLOCK_SIZE"]),
+        triton.cdiv(N_Size, meta["BLOCK_SIZE"]),
+    )
+    weight_dequant_kernel[grid](x_in, s_in, y_out, M_Size, N_Size, BLOCK_SIZE=block_size)
+    return y_out
+
+def linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    scale_fmt: str | None = None,
+) -> torch.Tensor:
+    """# noqa: D205
+    Applies a linear transformation to the incoming data: y = xA^T + b.
+    This function supports specialized implementations based on quantization
+    and tensor formats.
+
+    Args:
+        x (torch.Tensor): The input tensor.
+        weight (torch.Tensor): The weight tensor. It may be quantized and
+            requires dequantization for certain cases.
+        bias (Optional[torch.Tensor]): The bias tensor to be added. Default is None.
+        scale_fmt (Optional[str]): The format of scaling factors.
+
+    Returns:
+        torch.Tensor: The result of the linear transformation, which may involve
+        quantization-aware computations depending on the input parameters.
+
+    Notes:
+        - If `weight` is quantized (e.g., `element_size() == 1`), a dequantized version
+          is used for computation.
+        - For other cases, the function applies quantization to `x` and
+         uses `fp8_gemm` for computation.
+    """
+    assert bias is None
+
+    if weight.dtype != torch.float8_e4m3fn:  # noqa: R505
+        return F.linear(x, weight)
+    if gemm_impl == "bf16":
+        weight = weight_dequant(weight, weight.scale)
+        return F.linear(x, weight)
+
+    x, scale = act_quant(x, block_size, scale_fmt)
+    return fp8_gemm(x, scale, weight, weight.scale)
+
 
 @dataclass
 class ModelArgs:
@@ -132,36 +244,7 @@ class ParallelEmbedding(nn.Module):
         return y
 
 
-def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None,
-           scale_fmt: Optional[str] = None) -> torch.Tensor:
-    """
-    Applies a linear transformation to the incoming data: y = xA^T + b.
-    This function supports specialized implementations based on quantization
-    and tensor formats.
 
-    Args:
-        x (torch.Tensor): The input tensor.
-        weight (torch.Tensor): The weight tensor. It may be quantized and
-            requires dequantization for certain cases.
-        bias (Optional[torch.Tensor]): The bias tensor to be added. Default is None.
-        scale_fmt (Optional[str]): The format of scaling factors.
-
-    Returns:
-        torch.Tensor: The result of the linear transformation, which may involve
-        quantization-aware computations depending on the input parameters.
-
-    Notes:
-        - If `weight` is quantized (e.g., `element_size() == 1`), a dequantized version
-          is used for computation.
-        - For other cases, the function applies quantization to `x` and uses `fp8_gemm` for computation.
-    """
-    assert bias is None
-
-    if weight.dtype != torch.float8_e4m3fn:
-        return F.linear(x, weight)
-    else:
-        x, scale = act_quant(x, block_size, scale_fmt)
-        return fp8_gemm(x, scale, weight, weight.scale)
 
 
 class Linear(nn.Module):
@@ -294,7 +377,7 @@ class RMSNorm(nn.Module):
         Returns:
             torch.Tensor: Normalized tensor with the same shape as input.
         """
-        dtype = torch.bfloat16
+        dtype = x.dtype
         if residual is None:
             x = x.float()
             var = x.pow(2).mean(-1, keepdim=True)
@@ -481,14 +564,6 @@ class Indexer(torch.nn.Module):
         return topk_indices
 
 
-def weight_dequant(weight, scale):
-    shape = weight.shape
-    assert weight.dim() == 2
-    weight = weight.view(shape[0] // block_size, block_size, shape[1] // block_size, block_size).transpose(1, 2).contiguous().view(-1, block_size * block_size)
-    weight = (weight.float() * scale.view(-1, 1).float()).to(torch.get_default_dtype()).view(shape[0] // block_size, shape[1] // block_size, block_size, block_size).transpose(1, 2).contiguous().view(shape)
-    return weight
-
-
 class MLA(nn.Module):
     """
     Multi-Head Latent Attention (MLA) Layer.
@@ -550,21 +625,17 @@ class MLA(nn.Module):
         """
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
-        q_o = self.wq_a(x)
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr)
         q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
-
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         q_pe = apply_rotary_emb(q_pe, freqs_cis)
         kv = self.wkv_a(x)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-
         kv = self.kv_norm(kv)
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
         self.kv_cache[:bsz, start_pos:end_pos] = kv
         self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
-    
         if mask is not None:    # MHA prefill
             q = torch.cat([q_nope, q_pe], dim=-1)
             kv = self.wkv_b(kv)
@@ -836,7 +907,6 @@ class Block(nn.Module):
         Returns:
             torch.Tensor: Output tensor after block computation.
         """
-        """
         if residual is None:
             x, residual = self.attn_norm(x), x
         else:
@@ -845,16 +915,6 @@ class Block(nn.Module):
         x, residual = self.ffn_norm(x, residual)
         x = self.ffn(x)
         return x, residual
-        """
-
-        if residual is None:
-            x_residual = x.float()
-        else:
-            x_residual = x.float() + residual.float()
-        x = self.attn(self.attn_norm(x_residual), start_pos, freqs_cis, mask)
-
-        x_residual = x.float() + x_residual.float()
-        return self.ffn(self.ffn_norm(x_residual)), x_residual.to(torch.bfloat16)
 
 
 class Transformer(nn.Module):

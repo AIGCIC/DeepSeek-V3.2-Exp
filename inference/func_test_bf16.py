@@ -5,7 +5,7 @@ import re
 import json
 from model import ModelArgs
 
-from model import Transformer as DeepSeekV32Transformer
+from model_bf16 import Transformer as DeepSeekV32Transformer
 from tilert.models.deepseek_v3_2.model import (
     Transformer as TilertDeepSeekV32Transformer,
 )
@@ -103,7 +103,7 @@ def test_e2e_forward_pass(model_config):
     model_args = ModelArgs(**model_config)
 
     x = torch.randint(0, model_args.vocab_size, (1, 1))
-
+    # When testing golden, gemm_impl in mlp.py should also be set to "bf16"
     tilert_model = TilertDeepSeekV32Transformer(model_args, enable_tilert=True)
     origin_model = DeepSeekV32Transformer(model_args)
     print(f"Element number of tilert_model.state_dict(): {len(tilert_model.state_dict())}")
