@@ -1,7 +1,7 @@
 import pytest
 import torch
 import re
-
+import time
 import json
 from model import ModelArgs
 
@@ -104,7 +104,8 @@ def test_e2e_forward_pass(model_config):
 
     x = torch.randint(0, model_args.vocab_size, (1, 1))
 
-    tilert_model = TilertDeepSeekV32Transformer(model_args, enable_tilert=True)
+    tilert_model = TilertDeepSeekV32Transformer(model_args)
+    tilert_model.enable_tilert(True)
     origin_model = DeepSeekV32Transformer(model_args)
     print(f"Element number of tilert_model.state_dict(): {len(tilert_model.state_dict())}")
     print(f"Element number of origin_model.state_dict(): {len(origin_model.state_dict())}")
@@ -114,9 +115,18 @@ def test_e2e_forward_pass(model_config):
 
     origin_model.load_state_dict(conv_dict)
 
-
     ref_output = origin_model(x, start_pos=127)
     tilert_output = tilert_model(x, start_pos=127)
+
+    for _ in range(2):
+        t0 = time.time()
+        ref_output = origin_model(x, start_pos=127)
+        t1 = time.time()
+        tilert_output = tilert_model(x, start_pos=127)
+        t2 = time.time()
+        print(f"Time taken for ref_output: {t1 - t0}")
+        print(f"Time taken for tilert_output: {t2 - t1}")
+
     abs_err = torch.abs(ref_output - tilert_output)
     rel_err = abs_err / torch.abs(ref_output)
     print(f"Rel err: max-{rel_err.max():.6f}/mean-{rel_err.mean():.6f}")

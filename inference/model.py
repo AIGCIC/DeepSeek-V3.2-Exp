@@ -696,7 +696,7 @@ class Gate(nn.Module):
         if self.score_func == "sigmoid":
             weights /= weights.sum(dim=-1, keepdim=True)
         weights *= self.route_scale
-        print(f"GT indices: {torch.sort(indices)[0]}")
+        #print(f"GT indices: {torch.sort(indices)[0]}")
         return weights, indices
 
 
