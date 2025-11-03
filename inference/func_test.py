@@ -72,6 +72,9 @@ def convert_state_dict(tilert_state_dict: dict) -> dict:
         r"layers\.(\d+)\.attn\.layernorm_rope_rotate\.k_norm\.bias": r"layers.\1.attn.indexer.k_norm.bias",
 
         r"layers\.(\d+)\.attn\.proj_w\.weights_proj\.weight": r"layers.\1.attn.indexer.weights_proj.weight",
+        r"layers\.(\d+)\.attn\.unproj_o_allreduce\.wo\.weight": r"layers.\1.attn.wo.weight",
+        r"layers\.(\d+)\.attn\.unproj_o_allreduce\.wo\.scale": r"layers.\1.attn.wo.scale",
+
 
     }
 
@@ -106,6 +109,7 @@ def test_e2e_forward_pass(model_config):
 
     tilert_model = TilertDeepSeekV32Transformer(model_args)
     tilert_model.enable_tilert(True)
+    tilert_model.enable_external_profiling_log(True)
     origin_model = DeepSeekV32Transformer(model_args)
     print(f"Element number of tilert_model.state_dict(): {len(tilert_model.state_dict())}")
     print(f"Element number of origin_model.state_dict(): {len(origin_model.state_dict())}")
@@ -118,7 +122,7 @@ def test_e2e_forward_pass(model_config):
     ref_output = origin_model(x, start_pos=127)
     tilert_output = tilert_model(x, start_pos=127)
 
-    for _ in range(2):
+    for _ in range(20):
         t0 = time.time()
         ref_output = origin_model(x, start_pos=127)
         t1 = time.time()
