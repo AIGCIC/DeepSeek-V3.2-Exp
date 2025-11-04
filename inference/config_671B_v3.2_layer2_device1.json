@@ -1,5 +1,5 @@
 {
-    "vocab_size": 129280,
+    "vocab_size": 16160,
     "dim": 7168,
     "inter_dim": 2304,
     "moe_inter_dim": 256,
