@@ -177,10 +177,10 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--ckpt-path", type=str, required=True)
     parser.add_argument("--config", type=str, required=True)
-    parser.add_argument("--input-file", type=str, default="")
+    parser.add_argument("--input-file", type=str, default="test_input.txt")
     parser.add_argument("--interactive", action="store_true")
-    parser.add_argument("--max-new-tokens", type=int, default=200)
-    parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--max-new-tokens", type=int, default=20)
+    parser.add_argument("--temperature", type=float, default=0.0)
     args = parser.parse_args()
     assert args.input_file or args.interactive, "Either input-file or interactive mode must be specified"
     main(args.ckpt_path, args.config, args.input_file, args.interactive, args.max_new_tokens, args.temperature)

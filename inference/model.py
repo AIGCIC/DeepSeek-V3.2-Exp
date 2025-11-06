@@ -1,7 +1,8 @@
+import os
 import math
 from dataclasses import dataclass
 from typing import Tuple, Optional, Literal
-
+import pickle
 from einops import rearrange
 import torch
 from torch import nn
@@ -535,7 +536,7 @@ class MLA(nn.Module):
         self.register_buffer("pe_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.qk_rope_head_dim), persistent=False)
         self.dequant_wkv_b = None
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor], intermediate_dict: Optional[dict] = None):
         """
         Forward pass for the Multi-Head Latent Attention (MLA) Layer.
 
@@ -551,8 +552,12 @@ class MLA(nn.Module):
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
         qr = self.q_norm(self.wq_a(x))
+        if intermediate_dict is not None:
+            intermediate_dict['attn_qr'] = qr.to(torch.float32).detach().cpu().numpy()
         q = self.wq_b(qr)
         q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
+        if intermediate_dict is not None:
+            intermediate_dict['attn_q'] = q.to(torch.float32).detach().cpu().numpy()
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         q_pe = apply_rotary_emb(q_pe, freqs_cis)
         kv = self.wkv_a(x)
@@ -560,7 +565,11 @@ class MLA(nn.Module):
         kv = self.kv_norm(kv)
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
         self.kv_cache[:bsz, start_pos:end_pos] = kv
+        if intermediate_dict is not None:
+            intermediate_dict['attn_kv_cache'] = self.kv_cache.to(torch.float32).detach().cpu().numpy()
         self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
+        if intermediate_dict is not None:
+            intermediate_dict['attn_pe_cache'] = self.pe_cache.to(torch.float32).detach().cpu().numpy()
         if mask is not None:    # MHA prefill
             q = torch.cat([q_nope, q_pe], dim=-1)
             kv = self.wkv_b(kv)
@@ -583,17 +592,29 @@ class MLA(nn.Module):
             wkv_b = self.wkv_b.weight if self.dequant_wkv_b is None else self.dequant_wkv_b
             wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
             q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
+            if intermediate_dict is not None:
+                intermediate_dict['attn_q_nope_before_scores'] = q_nope.to(torch.float32).detach().cpu().numpy()
             scores = (torch.einsum("bshc,btc->bsht", q_nope.float(), self.kv_cache[:bsz, :end_pos].float()) +
                       torch.einsum("bshr,btr->bsht", q_pe.float(), self.pe_cache[:bsz, :end_pos].float())) * self.softmax_scale
+            if intermediate_dict is not None:
+                intermediate_dict['attn_scores_before_indexer'] = scores.to(torch.float32).detach().cpu().numpy()
 
             # indexer
             topk_indices = self.indexer(x, qr, start_pos, freqs_cis, mask)
+            if intermediate_dict is not None:
+                intermediate_dict['attn_topk_indices'] = topk_indices.to(torch.float32).detach().cpu().numpy()
             index_mask = torch.full((bsz, 1, end_pos), float("-inf"), device=x.device).scatter_(-1, topk_indices, 0)
             scores += index_mask.unsqueeze(2)
 
             scores = scores.softmax(dim=-1, dtype=torch.float32)
+            if intermediate_dict is not None:
+                intermediate_dict['attn_scores_softmax'] = scores.to(torch.float32).detach().cpu().numpy()
             x = torch.einsum("bsht,btc->bshc", scores.type_as(x), self.kv_cache[:bsz, :end_pos])
+            if intermediate_dict is not None:
+                intermediate_dict['attn_x_after_mla'] = x.to(torch.float32).detach().cpu().numpy()
             x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
+            if intermediate_dict is not None:
+                intermediate_dict['attn_x_after_unproj_ob'] = x.to(torch.float32).detach().cpu().numpy()
         x = self.wo(x.flatten(2))
         return x
 
@@ -832,14 +853,23 @@ class Block(nn.Module):
         Returns:
             torch.Tensor: Output tensor after block computation.
         """
+        res_dict = {}
+        res_dict['x_input'] = x.to(torch.float32).detach().cpu().numpy()
+        res_dict['freqs_cis_input'] = torch.view_as_real(freqs_cis).to(torch.float32).cpu().numpy()
         if residual is None:
             x, residual = self.attn_norm(x), x
         else:
+            res_dict['residual_input'] = residual.to(torch.float32).detach().cpu().numpy()
             x, residual = self.attn_norm(x, residual)
-        x = self.attn(x, start_pos, freqs_cis, mask)
+        res_dict['x_input_rmsnorm'] = x.to(torch.float32).detach().cpu().numpy()
+        x = self.attn(x, start_pos, freqs_cis, mask, res_dict)
+        res_dict['x_after_attn'] = x.detach().to(torch.float32).cpu().numpy()
+        res_dict['residual_after_attn'] = residual.detach().to(torch.float32).cpu().numpy()
         x, residual = self.ffn_norm(x, residual)
         x = self.ffn(x)
-        return x, residual
+        res_dict['x_after_ffn'] = x.detach().to(torch.float32).cpu().numpy()
+        res_dict['residual_after_ffn'] = residual.detach().to(torch.float32).cpu().numpy()
+        return x, residual, res_dict
 
 
 class Transformer(nn.Module):
@@ -874,7 +904,7 @@ class Transformer(nn.Module):
             self.layers.append(Block(layer_id, args))
         self.norm = RMSNorm(args.dim)
         # lm_head in the checkpoint is stored in bf16, while the parameter here is stored in fp32 for easier computation of logits later.
-        self.head = ColumnParallelLinear(args.dim, args.vocab_size, dtype=torch.float32)
+        self.head = ColumnParallelLinear(args.dim, args.vocab_size, dtype=torch.bfloat16)
         self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
 
     @torch.inference_mode()
@@ -893,10 +923,20 @@ class Transformer(nn.Module):
         freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
         mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1) if seqlen > 1 else None
         h, residual = self.embed(tokens), None
-        for layer in self.layers:
-            h, residual = layer(h, residual, start_pos, freqs_cis, mask)
+        res_list = []
+        input_dict = {}
+        input_dict['x_input'] = h.to(torch.float32).detach().cpu().numpy()
+        input_dict['token_input'] = tokens.to(torch.int32).detach().cpu().numpy()
+        res_list.append(input_dict)
+        sel_layers = [self.layers[0], self.layers[3]]
+        for layer in sel_layers:
+            h, residual, res_dict = layer(h, residual, start_pos, freqs_cis, mask)
+            res_list.append(res_dict)
+        if rank == 0 or start_pos == 0:
+            os.makedirs("gt_res_dump_layer_1_1_new", exist_ok=True)
+            pickle.dump(res_list, open(f"gt_res_dump_layer_1_1/res_list_rank{rank}_pos{start_pos}.pkl", "wb"))
         h, _ = self.norm(h, residual)
-        logits = self.head(h[:, -1].float())
+        logits = self.head(h[:, -1])#.float())
         if world_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(world_size)]
             dist.all_gather(all_logits, logits)

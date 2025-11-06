@@ -1,3 +1,4 @@
+# To do this test, you need to manually set the layer number of DSAShowHands to be same as the number in config.
 import pytest
 import torch
 import re
