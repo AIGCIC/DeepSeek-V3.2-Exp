@@ -1,0 +1,1 @@
+torchrun --nproc-per-node 8 generate.py --ckpt-path=/data2/shared/deepseek_v32_converted_m8 --config config_671B_v3.2.json --input-file=test_input.txt
